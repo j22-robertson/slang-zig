@@ -66,6 +66,15 @@ pub fn build(b: *std.Build) void {
     lib.step.dependOn(&install_slang_lib.step);
     lib.step.dependOn(&install_slang_bin.step);
 
+    // Expose the vendor bin/ and lib/ directories so consumers (parent
+    // builds using slang-zig as a dep) can install the runtime DLLs
+    // alongside their own executable. Without this, only the Zig wrapper
+    // lib gets installed and Windows .exe's can't find slang.dll at runtime.
+    const expose_bin = b.addNamedWriteFiles("slang_bin");
+    _ = expose_bin.addCopyDirectory(bin_path, "", .{});
+    const expose_lib = b.addNamedWriteFiles("slang_lib");
+    _ = expose_lib.addCopyDirectory(lib_path, "", .{});
+
     const exe_mod = b.addModule("example", .{
         .root_source_file = b.path("example/example.zig"),
         .target = target,
