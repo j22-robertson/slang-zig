@@ -3,7 +3,28 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    // Determine dependency name based on target
+
+    const lib_mod = b.addModule("slang", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+    lib_mod.link_libc = true;
+    lib_mod.link_libcpp = true;
+    lib_mod.addIncludePath(b.path("src"));
+    lib_mod.addIncludePath(b.path("src/c"));
+    lib_mod.addCSourceFile(.{ .file = b.path("src/c/slangc.cpp"), .flags = &.{"-std=c++17"} });
+    lib_mod.linkSystemLibrary("slang", .{});
+
+    const lib = b.addLibrary(.{
+        .name = "slang",
+        .root_module = lib_mod,
+    });
+    b.installArtifact(lib);
+
+    const expose_bin = b.addNamedWriteFiles("slang_bin");
+    const expose_lib = b.addNamedWriteFiles("slang_lib");
+
     const dep_name = switch (target.result.os.tag) {
         .windows => switch (target.result.cpu.arch) {
             .x86_64 => "slang-windows-x86_64",
@@ -23,78 +44,52 @@ pub fn build(b: *std.Build) void {
         else => @panic("unsupported OS for Slang"),
     };
 
-    const slang_dep = b.lazyDependency(dep_name, .{}) orelse @panic("failed to resolve Slang dependency");
-    // Get paths to the extracted Slang files
-    const include_path = slang_dep.path("include");
-    const lib_path = slang_dep.path("lib");
-    const bin_path = slang_dep.path("bin");
-    // Main library with ALL the linking configuration
-    const lib_mod = b.addModule("slang", .{
-        .root_source_file = b.path("src/lib.zig"),
-        .optimize = optimize,
-        .target = target,
-    });
-    const lib = b.addLibrary(.{
-        .name = "slang",
-        .root_module = lib_mod,
-    });
+    // Fill in vendor-specific include/library paths only when the dep is
+    // actually fetched. On pass 1 this just queues the fetch and returns
+    // null; Zig will re-run after fetching.
+    if (b.lazyDependency(dep_name, .{})) |slang_dep| {
+        const include_path = slang_dep.path("include");
+        const lib_path = slang_dep.path("lib");
+        const bin_path = slang_dep.path("bin");
 
-    lib.root_module.link_libc = true;
-    lib.root_module.link_libcpp = true;
+        lib_mod.addIncludePath(include_path);
+        lib_mod.addLibraryPath(lib_path);
+        lib_mod.addLibraryPath(bin_path);
 
-    lib.root_module.addIncludePath(include_path);
-    lib.root_module.addIncludePath(b.path("src"));
-    lib.root_module.addIncludePath(b.path("src/c"));
-    lib.root_module.addLibraryPath(lib_path);
-    lib.root_module.addLibraryPath(bin_path);
-    lib.root_module.linkSystemLibrary("slang", .{});
-    lib.root_module.addCSourceFile(.{ .file = b.path("src/c/slangc.cpp"), .flags = &.{"-std=c++17"} });
+        const install_slang_lib = b.addInstallDirectory(.{
+            .source_dir = lib_path,
+            .install_dir = .lib,
+            .install_subdir = "",
+        });
+        const install_slang_bin = b.addInstallDirectory(.{
+            .source_dir = bin_path,
+            .install_dir = .bin,
+            .install_subdir = "",
+        });
+        lib.step.dependOn(&install_slang_lib.step);
+        lib.step.dependOn(&install_slang_bin.step);
 
-    b.installArtifact(lib);
-    // Copy Slang shared libraries to the install directory
-    const install_slang_lib = b.addInstallDirectory(.{
-        .source_dir = lib_path,
-        .install_dir = .lib,
-        .install_subdir = "",
-    });
-    const install_slang_bin = b.addInstallDirectory(.{
-        .source_dir = bin_path,
-        .install_dir = .bin,
-        .install_subdir = "",
-    });
-    // Make sure the Slang libraries are installed when building
-    lib.step.dependOn(&install_slang_lib.step);
-    lib.step.dependOn(&install_slang_bin.step);
+        _ = expose_bin.addCopyDirectory(bin_path, "", .{});
+        _ = expose_lib.addCopyDirectory(lib_path, "", .{});
 
-    // Expose the vendor bin/ and lib/ directories so consumers (parent
-    // builds using slang-zig as a dep) can install the runtime DLLs
-    // alongside their own executable. Without this, only the Zig wrapper
-    // lib gets installed and Windows .exe's can't find slang.dll at runtime.
-    const expose_bin = b.addNamedWriteFiles("slang_bin");
-    _ = expose_bin.addCopyDirectory(bin_path, "", .{});
-    const expose_lib = b.addNamedWriteFiles("slang_lib");
-    _ = expose_lib.addCopyDirectory(lib_path, "", .{});
+        const exe_mod = b.addModule("example", .{
+            .root_source_file = b.path("example/example.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const exe = b.addExecutable(.{
+            .name = "example",
+            .root_module = exe_mod,
+        });
+        exe_mod.addLibraryPath(lib_path);
+        exe_mod.addLibraryPath(bin_path);
+        exe_mod.addImport("slang", lib.root_module);
+        exe_mod.linkLibrary(lib);
+        b.installArtifact(exe);
 
-    const exe_mod = b.addModule("example", .{
-        .root_source_file = b.path("example/example.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const exe = b.addExecutable(.{
-        .name = "example",
-        .root_module = exe_mod,
-    });
-
-    exe_mod.addLibraryPath(lib_path);
-    exe_mod.addLibraryPath(bin_path);
-
-    exe_mod.addImport("slang", lib.root_module);
-
-    exe_mod.linkLibrary(lib);
-    b.installArtifact(exe);
-
-    const run_example_cmd = b.addRunArtifact(exe);
-    const run_example = b.step("example", "Run the example executable");
-    run_example_cmd.step.dependOn(b.getInstallStep());
-    run_example.dependOn(&run_example_cmd.step);
+        const run_example_cmd = b.addRunArtifact(exe);
+        const run_example = b.step("example", "Run the example executable");
+        run_example_cmd.step.dependOn(b.getInstallStep());
+        run_example.dependOn(&run_example_cmd.step);
+    }
 }
